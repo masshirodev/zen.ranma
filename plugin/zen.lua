@@ -1,34 +1,39 @@
 -- zen: one pane with nothing around it.
 --
+-- Needs ranma 0.2.2 or newer.
+--
 -- leader z (or `:zen` in the palette) toggles zen on the workspace shown:
 --   the focused pane goes fullscreen (zen.fullscreen), so the other tiles
 --   and a monocle tab strip are hidden;
---   the bar is emptied and toolbars put away (zen.bar);
+--   the bar's row goes and toolbars are put away (zen.bar);
+--   pane borders and gaps go (zen.borders, zen.gaps);
 --   with zen.monocle, workspaces that follow the `layout` setting are laid
 --   out in monocle, so moving focus still shows one pane at a time.
 -- Leaving it puts back what was there: the fullscreen state the workspace
--- had, the bar and toolbars, the layout. `:zen on` and `:zen off` do one
--- way only. ranma.emit("zen", { on = true|false }) as it goes in and out.
+-- had, the bar, toolbars, borders, gaps and layout, and the profile that was
+-- in use (the mobile view, say). `:zen on` and `:zen off` do one way only.
+-- ranma.emit("zen", { on = true|false }) as it goes in and out.
 --
 -- Going to another workspace or session ends zen there and then. The pane
 -- fullscreened by zen is put back the next time that workspace is shown.
 -- A config reload keeps zen on (the state is in ranma.store("zen")); a new
 -- or upgraded server starts with it off.
 --
--- What ranma 0.1.0 cannot do from a plugin, so zen does not:
---   hide the bar's row: a profile can empty the bar but not move it to
---     `bar.position = "hidden"`, a theme key, and themes are read at load;
---   hide borders or gaps: `border.style` and `gaps.*` are theme keys too;
---   give back a profile you were using: nothing says which one is in use,
---     so leaving zen goes back to none (what init.lua sets).
---
 -- ranma's plugin API: https://github.com/masshirodev/ranma/blob/main/doc/CONFIG.md ("Profiles",
 -- "Hooks", "Commands", "A plugin's state").
 
 ranma.option("zen.bar", {
   type = "enum", choices = { "empty", "mode", "keep" }, default = "empty",
-  name = "Bar", desc = "In zen: empty the bar and put toolbars away, keep only the mode chip "
-    .. "(so WM mode still shows), or leave both as they are.",
+  name = "Bar", desc = "In zen: no bar at all (its row goes, toolbars are put away), "
+    .. "only the mode chip (so WM mode still shows), or the bar and toolbars as they are.",
+})
+ranma.option("zen.borders", {
+  type = "bool", default = false,
+  name = "Borders", desc = "In zen: keep pane borders. Off, they go.",
+})
+ranma.option("zen.gaps", {
+  type = "bool", default = false,
+  name = "Gaps", desc = "In zen: keep the gaps around and between panes. Off, they go.",
 })
 ranma.option("zen.fullscreen", {
   type = "bool", default = true,
@@ -40,37 +45,56 @@ ranma.option("zen.monocle", {
     .. "in monocle, one pane at a time as focus moves.",
 })
 
--- Options set in init.lua are not known yet while plugins load, so every
--- combination is declared now and the one wanted is picked on the way in.
+-- Profiles are declared while loading, and plugins load before init.lua sets
+-- their options, so one profile per combination is declared now and the one
+-- the options ask for is picked on the way in. Its name carries what differs
+-- from the defaults: `zen`, `zen.mode`, `zen.keep.monocle.borders`, ...
 local BARS = {
-  empty = { bar = { left = {}, center = {}, right = {} }, toolbars = {} },
+  empty = { theme = { bar = { position = "hidden" } }, toolbars = {} },
   mode = { bar = { left = { "mode" }, center = {}, right = {} }, toolbars = {} },
   keep = {},
 }
-local function profile_name(bar, monocle)
-  if bar == "keep" and not monocle then return nil end
+-- Every gap, the per-side ones included: a theme that sets `outer_top` would
+-- otherwise keep it over `outer_vertical = 0`.
+local NO_GAPS = {
+  inner = 0, outer_horizontal = 0, outer_vertical = 0,
+  outer_top = 0, outer_bottom = 0, outer_left = 0, outer_right = 0,
+}
+local function profile_name(bar, monocle, borders, gaps)
+  if bar == "keep" and not monocle and borders and gaps then return nil end
   return "zen" .. (bar == "empty" and "" or "." .. bar) .. (monocle and ".monocle" or "")
+    .. (borders and ".borders" or "") .. (gaps and ".gaps" or "")
 end
+local ZEN = {}
 for bar, def in pairs(BARS) do
   for _, monocle in ipairs({ false, true }) do
-    local name = profile_name(bar, monocle)
-    if name then
-      ranma.profile(name, {
-        bar = def.bar, toolbars = def.toolbars,
-        set = monocle and { layout = "monocle" } or nil,
-      })
+    for _, borders in ipairs({ false, true }) do
+      for _, gaps in ipairs({ false, true }) do
+        local name = profile_name(bar, monocle, borders, gaps)
+        if name then
+          local theme = {}
+          if def.theme then theme.bar = def.theme.bar end
+          if not borders then theme.border = { style = "none" } end
+          if not gaps then theme.gaps = NO_GAPS end
+          ranma.profile(name, {
+            bar = def.bar, toolbars = def.toolbars,
+            set = monocle and { layout = "monocle" } or nil,
+            theme = next(theme) and theme or nil,
+          })
+          ZEN[name] = true
+        end
+      end
     end
   end
 end
 
 local store = ranma.store("zen")
--- Between a fullscreen toggle and the deferred look at what it did.
-local busy = false
 
 -- `on`: zen is on, in `session`'s workspace `workspace`; `toggled`: zen
 -- turned that workspace's fullscreen on, so leaving turns it off; `profile`:
--- the profile zen put in use. `pending`: "session:workspace" keys whose
--- fullscreen zen turned on and could not take back, as the user had left.
+-- the profile zen put in use, and `previous` the one in use before it (nil
+-- for none). `pending`: "session:workspace" keys whose fullscreen zen turned
+-- on and could not take back, as the user had left.
 local Z
 local function blank()
   return { on = false, pending = {} }
@@ -93,43 +117,11 @@ ranma.on("config_reload", function()
   Z.pending = Z.pending or {}
 end)
 
-local function area()
-  local p = ranma.pane()
-  return p and p.cols * p.rows or 0
-end
-
--- `fullscreen` only toggles, and nothing reads a workspace's state, so the
--- focused pane's size tells: it grows when fullscreen goes on and shrinks
--- when it goes off. A pane's size is updated once the Lua that moved it
--- returns, hence the defer. One the same size either way (alone on its
--- workspace) is toggled and counted, which keeps the parity right when it
--- is undone.
-
--- Turn fullscreen on; done(true) if zen did, and so must turn it off.
-local function fullscreen_on(done)
-  local before = area()
-  ranma.action("fullscreen")
-  ranma.defer(0, function()
-    if area() < before then
-      ranma.action("fullscreen")
-      return done(false)
-    end
-    done(true)
-  end)
-end
-
--- Turn off the fullscreen zen turned on, unless the user already did.
-local function fullscreen_off()
-  local before = area()
-  ranma.action("fullscreen")
-  ranma.defer(0, function()
-    if area() > before then ranma.action("fullscreen") end
-  end)
-end
-
-local function here()
-  local s = ranma.state()
-  return s.session, s.workspace
+-- A message takes the bar's centre, and zen may have taken the bar's row
+-- away: while zen is on, its messages are toasts.
+local function say(msg)
+  if Z and Z.on then return ranma.toast(msg) end
+  ranma.notify(msg)
 end
 
 local function emit(on)
@@ -137,32 +129,28 @@ local function emit(on)
 end
 
 local function enter()
-  local session, ws = here()
-  if ws == 0 then return ranma.notify("zen: hide the scratchpad first") end
-  if not ranma.pane() then return ranma.notify("zen: no pane here") end
-  local full, monocle = ranma.get("zen.fullscreen"), ranma.get("zen.monocle")
-  local profile = profile_name(ranma.get("zen.bar"), monocle)
+  local s = ranma.state()
+  if s.workspace == 0 then return say("zen: hide the scratchpad first") end
+  if not ranma.pane() then return say("zen: no pane here") end
+  local full = ranma.get("zen.fullscreen")
+  local profile = profile_name(ranma.get("zen.bar"), ranma.get("zen.monocle"),
+    ranma.get("zen.borders"), ranma.get("zen.gaps"))
   if not full and not profile then
-    return ranma.notify("zen: every zen option is off; nothing to hide")
+    return say("zen: every zen option is off; nothing to hide")
   end
+  Z.on, Z.session, Z.workspace = true, s.session, s.workspace
+  Z.profile, Z.previous = profile, nil
   -- The profile first: monocle's tab strip is part of what fullscreen hides.
-  if profile then ranma.use_profile(profile) end
-  Z.on, Z.session, Z.workspace, Z.profile, Z.toggled = true, session, ws, profile, false
+  if profile then
+    -- One of zen's own still in use means zen's state was lost (a new
+    -- server); going back to it on the way out would keep zen's frame.
+    if not ZEN[s.profile or ""] then Z.previous = s.profile end
+    ranma.use_profile(profile)
+  end
+  Z.toggled = full and not s.fullscreen
+  if Z.toggled then ranma.action("fullscreen on") end
   save()
   emit(true)
-  if full then
-    busy = true
-    fullscreen_on(function(did)
-      busy = false
-      -- Left again before the answer came: the undo is the workspace's.
-      if did and not Z.on then
-        Z.pending[session .. ":" .. ws] = true
-      else
-        Z.toggled = did
-      end
-      save()
-    end)
-  end
 end
 
 -- `away`: the user is on another workspace now, where fullscreen is not
@@ -172,40 +160,42 @@ local function leave(away)
     if away then
       Z.pending[Z.session .. ":" .. Z.workspace] = true
     else
-      fullscreen_off()
+      ranma.action("fullscreen off")
     end
   end
-  if Z.profile then ranma.use_profile(nil) end
-  Z.on, Z.session, Z.workspace, Z.toggled, Z.profile = false, nil, nil, nil, nil
+  -- Only zen's own: a profile something else picked since (a driver_change
+  -- hook's mobile view) is that hook's choice, and stays.
+  if Z.profile and ranma.state().profile == Z.profile then
+    ranma.use_profile(Z.previous)
+  end
+  Z.on, Z.session, Z.workspace, Z.toggled, Z.profile, Z.previous = false, nil, nil, nil, nil, nil
   save()
   emit(false)
 end
 
 local function zen(want)
   ready()
-  if busy then return end
   if want == nil then want = not Z.on end
   if want == Z.on then return end
   if want then return enter() end
-  local _, ws = here()
-  if ws == 0 then return ranma.notify("zen: hide the scratchpad first") end
+  if ranma.state().workspace == 0 then return say("zen: hide the scratchpad first") end
   leave(false)
 end
 
 -- Somewhere else: zen ends. Back on a workspace zen left fullscreen: undo it.
 local function moved()
   ready()
-  local session, ws = here()
-  if ws == 0 then return end
-  if Z.on and (session ~= Z.session or ws ~= Z.workspace) then
+  local s = ranma.state()
+  if s.workspace == 0 then return end
+  if Z.on and (s.session ~= Z.session or s.workspace ~= Z.workspace) then
     local was = Z.workspace
     leave(true)
-    ranma.notify("zen: off, as workspace " .. was .. " was left")
+    say("zen: off, as workspace " .. was .. " was left")
   end
-  local key = session .. ":" .. ws
+  local key = s.session .. ":" .. s.workspace
   if Z.pending[key] then
     Z.pending[key] = nil
-    fullscreen_off()
+    ranma.action("fullscreen off")
     save()
   end
 end
@@ -217,7 +207,7 @@ ranma.command("zen", function(arg)
   if arg == "" then return zen(nil) end
   if arg == "on" then return zen(true) end
   if arg == "off" then return zen(false) end
-  ranma.notify("zen: on, off, or nothing to toggle")
+  say("zen: on, off, or nothing to toggle")
 end, { desc = "one pane with nothing around it", args = "[on|off]", complete = { "on", "off" } })
 
 -- WM mode ends with it: with the bar emptied, nothing would say it is on.
